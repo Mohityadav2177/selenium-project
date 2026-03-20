@@ -1,0 +1,409 @@
+---
+# ===========================================================
+# TEST-HFCL  —  Switch Test Automation Playbook
+# ===========================================================
+# Runs all test scripts against each switch and produces a
+# per-switch summary showing PASS/FAIL count + per-script result.
+#
+# FIRMWARE GATE (fully self-contained in this YAML):
+#   Before running any test, an inline Python script inside
+#   shell: connects to the switch via paramiko, runs
+#   "show version", parses Primary/Backup versions, compares
+#   them against required_version, and outputs JSON.
+#   No external helper .py file needed.
+#
+#   - Primary firmware >= v24.01.356  → run all tests  ✅
+#   - Primary < required, Backup >= required
+#                                     → SKIP, warn at end ⚠️
+#   - Neither meets requirement       → SKIP, warn at end ❌
+#
+# Usage:
+#   ansible-playbook switch.yaml -i inventory.ini
+#
+# Expected inventory.ini:
+#   [switches]
+#   192.168.180.155  ansible_user=admin  ansible_password=admin
+#   192.168.180.136  ansible_user=admin  ansible_password=admin
+# ===========================================================
+
+- name: HFCL Switch Test Suite
+  hosts: switches
+  gather_facts: false
+  vars:
+    python_path:      "/home/hfcl/jenkins-venv/bin/python3"
+    script_path:      "/home/hfcl"
+    required_version: "24.01.356"        # minimum firmware (without v prefix)
+    scripts:
+      - test1.py
+      - test2.py
+      - test3.py
+      - test4.py
+      - test5.py
+      - test6.py
+      - test7.py
+      - test8.py
+      - test9.py
+      - test10.py
+
+  tasks:
+
+    # =======================================================
+    # FIRMWARE GATE
+    # All version logic is inside this YAML — no helper file.
+    # =======================================================
+
+    # ─────────────────────────────────────────────────────
+    # STEP 1 — Inline Python: SSH to switch, run show version,
+    #          parse Primary/Backup, compare, output JSON
+    # ─────────────────────────────────────────────────────
+    - name: "FIRMWARE CHECK — Fetch and compare version ({{ inventory_hostname }})"
+      shell: |
+        {{ python_path }} - << 'PYEOF'
+        import re, sys, time, json, paramiko
+
+        HOST     = "{{ inventory_hostname }}"
+        USER     = "{{ ansible_user }}"
+        PASS     = "{{ ansible_password }}"
+        REQUIRED = "{{ required_version }}"
+
+        def ver_tuple(v):
+            """Convert vMAJ.MIN.PATCH to (MAJ, MIN, PATCH) as ints."""
+            v = v.strip().lstrip("v")
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except Exception:
+                return (0, 0, 0)
+
+        def meets_req(version, required):
+            """Return True if version >= required."""
+            return ver_tuple(version) >= ver_tuple(required)
+
+        def extract_version(text, section):
+            """
+            Extract version number after a section heading.
+            Looks for: <section>...Version : vXX.XX.XXX
+            """
+            pattern = section + r".*?Version\s*:\s*(v[\d]+\.[\d]+\.[\d]+)"
+            m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            return m.group(1) if m else ""
+
+        # ── Connect via interactive shell (works on all HFCL switches)
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(HOST, port=22, username=USER, password=PASS,
+                           timeout=15, look_for_keys=False, allow_agent=False)
+            shell = client.invoke_shell()
+            time.sleep(0.3)
+            # drain banner/MOTD
+            while shell.recv_ready():
+                shell.recv(4096)
+                time.sleep(0.05)
+            # send show version
+            shell.send("show version\n")
+            out      = ""
+            deadline = time.time() + 10
+            last     = time.time()
+            while time.time() < deadline:
+                time.sleep(0.1)
+                chunk = ""
+                while shell.recv_ready():
+                    chunk += shell.recv(4096).decode("utf-8", errors="ignore")
+                    time.sleep(0.02)
+                if chunk:
+                    out += chunk
+                    last = time.time()
+                if out and (time.time() - last) > 1.5:
+                    break
+            client.close()
+        except Exception as e:
+            print(json.dumps({
+                "primary": "", "backup": "",
+                "primary_ok": False, "backup_ok": False,
+                "error": str(e)
+            }))
+            sys.exit(0)
+
+        # ── Strip ANSI escape codes
+        out = re.sub(r"\x1b\[[0-9;]*[mGKH]", "", out)
+
+        # ── Parse versions from each section
+        primary = extract_version(out, "Primary Image")
+        backup  = extract_version(out, "Backup Image")
+
+        # ── Compare against required version
+        primary_ok = meets_req(primary, REQUIRED) if primary else False
+        backup_ok  = meets_req(backup,  REQUIRED) if backup  else False
+
+        # ── Output JSON for Ansible to read back via from_json
+        print(json.dumps({
+            "primary":    primary,
+            "backup":     backup,
+            "primary_ok": primary_ok,
+            "backup_ok":  backup_ok,
+            "error":      ""
+        }))
+        PYEOF
+      register: fw_check_raw
+      ignore_errors: yes
+      delegate_to: localhost
+
+    # ─────────────────────────────────────────────────────
+    # STEP 2 — Load JSON result into Ansible facts
+    # ─────────────────────────────────────────────────────
+    - name: "FIRMWARE CHECK — Load version result into facts"
+      set_fact:
+        primary_version_raw: "{{ (fw_check_raw.stdout | from_json).primary    | default('') }}"
+        backup_version_raw:  "{{ (fw_check_raw.stdout | from_json).backup     | default('') }}"
+        primary_ok:          "{{ (fw_check_raw.stdout | from_json).primary_ok | bool }}"
+        backup_ok:           "{{ (fw_check_raw.stdout | from_json).backup_ok  | bool }}"
+        fw_error:            "{{ (fw_check_raw.stdout | from_json).error      | default('') }}"
+
+    # ─────────────────────────────────────────────────────
+    # STEP 3 — Set gate decision + skip reason
+    # ─────────────────────────────────────────────────────
+    - name: "FIRMWARE CHECK — Set gate decision"
+      set_fact:
+        firmware_gate_passed: "{{ primary_ok | bool }}"
+        firmware_skip_reason: >-
+          {%- if fw_error != '' -%}
+          SSH/connection error: {{ fw_error }}
+          {%- elif not (primary_ok | bool) and (backup_ok | bool) -%}
+          Primary {{ primary_version_raw }} is below v{{ required_version }}.
+          Backup {{ backup_version_raw }} has the required firmware.
+          Action: activate backup image and reboot switch.
+          {%- elif not (primary_ok | bool) and not (backup_ok | bool) -%}
+          Primary {{ primary_version_raw if primary_version_raw != '' else 'unknown' }}
+          and Backup {{ backup_version_raw if backup_version_raw != '' else 'unknown' }}
+          are both below v{{ required_version }}.
+          Action: upgrade firmware to v{{ required_version }} or above.
+          {%- else -%}
+          N/A
+          {%- endif -%}
+
+    # ─────────────────────────────────────────────────────
+    # STEP 4 — Print firmware gate decision
+    # ─────────────────────────────────────────────────────
+    - name: "FIRMWARE CHECK — Print gate result for {{ inventory_hostname }}"
+      debug:
+        msg: |
+
+          ┌─────────────────────────────────────────────────────┐
+            FIRMWARE VERSION CHECK  →  {{ inventory_hostname }}
+          ├─────────────────────────────────────────────────────┤
+            Required : v{{ required_version }} or above
+            Primary  : {{ primary_version_raw if primary_version_raw != '' else '(not found)' }}
+                       {{ '✅ MEETS REQUIREMENT' if primary_ok else '❌ BELOW REQUIREMENT' }}
+            Backup   : {{ backup_version_raw  if backup_version_raw  != '' else '(not found)' }}
+                       {{ '✅ MEETS REQUIREMENT' if backup_ok  else '❌ BELOW REQUIREMENT' }}
+          ├─────────────────────────────────────────────────────┤
+          {% if fw_error != '' %}
+            DECISION : ❌ ERROR — {{ fw_error }}
+          {% elif primary_ok | bool %}
+            DECISION : ✅ PRIMARY OK — Proceeding with all tests
+          {% elif backup_ok | bool %}
+            DECISION : ⚠️  TESTS SKIPPED
+                       Primary {{ primary_version_raw }} < v{{ required_version }}
+                       Backup  {{ backup_version_raw  }} has required firmware
+                       → Activate backup image and reboot to enable testing
+          {% else %}
+            DECISION : ❌ TESTS SKIPPED
+                       Neither image meets v{{ required_version }}
+                       → Upgrade firmware before running tests
+          {% endif %}
+          └─────────────────────────────────────────────────────┘
+
+
+    # =======================================================
+    # TEST EXECUTION — Only runs if firmware gate passed
+    # =======================================================
+
+    # ─────────────────────────────────────────────────────
+    # STEP 5 — Run all test scripts
+    # ─────────────────────────────────────────────────────
+    - name: Run test scripts
+      command: >
+        {{ python_path }} {{ script_path }}/{{ item }}
+        {{ inventory_hostname }}
+        {{ ansible_user }}
+        {{ ansible_password }}
+      loop: "{{ scripts }}"
+      register: script_results
+      ignore_errors: yes
+      delegate_to: localhost
+      when: firmware_gate_passed | bool
+
+    # ─────────────────────────────────────────────────────
+    # STEP 6 — Build result map  { script: rc }
+    # ─────────────────────────────────────────────────────
+    - name: Build result summary (firmware OK)
+      set_fact:
+        test_summary: >-
+          {{
+            dict(
+              script_results.results | map(attribute='item') |
+              zip(script_results.results | map(attribute='rc'))
+            )
+          }}
+      when: firmware_gate_passed | bool and script_results is defined
+
+    - name: Set empty result summary (firmware SKIPPED)
+      set_fact:
+        test_summary: {}
+      when: not (firmware_gate_passed | bool)
+
+    # ─────────────────────────────────────────────────────
+    # STEP 7 — Count PASS / FAIL
+    # ─────────────────────────────────────────────────────
+    - name: Count PASS and FAIL per switch
+      set_fact:
+        pass_count:  "{{ test_summary.values() | select('equalto', 0)  | list | length }}"
+        fail_count:  "{{ test_summary.values() | reject('equalto', 0)  | list | length }}"
+        total_count: "{{ test_summary | length }}"
+
+    # ─────────────────────────────────────────────────────
+    # STEP 8 — Print per-switch result
+    # ─────────────────────────────────────────────────────
+    - name: Print per-switch test result
+      debug:
+        msg: |
+
+          ╔══════════════════════════════════════════════════════╗
+            Switch   : {{ inventory_hostname }}
+            Firmware : {{ primary_version_raw if primary_version_raw != '' else 'unknown' }}
+            Total    : {{ total_count }} tests  |  PASS: {{ pass_count }}  |  FAIL: {{ fail_count }}
+          ╚══════════════════════════════════════════════════════╝
+
+          {% if not (firmware_gate_passed | bool) %}
+          ⛔  ALL TESTS SKIPPED
+              {{ firmware_skip_reason | replace('\n', '\n          ') }}
+
+          {% else %}
+          {% for script, rc in test_summary.items() %}
+          {% if rc == 0 %}
+            ✅  PASS  →  {{ script }}
+          {% else %}
+            ❌  FAIL  →  {{ script }}  (exit code: {{ rc }})
+          {% endif %}
+          {% endfor %}
+
+          ── RESULT : {{ 'ALL PASSED ✅' if fail_count | int == 0 else fail_count | string + ' TEST(S) FAILED ❌' }} ──
+          {% endif %}
+
+    # ─────────────────────────────────────────────────────
+    # STEP 9 — Store report for global summary
+    # ─────────────────────────────────────────────────────
+    - name: Store per-switch report
+      set_fact:
+        switch_report:
+          host:            "{{ inventory_hostname }}"
+          primary_version: "{{ primary_version_raw | default('unknown') }}"
+          backup_version:  "{{ backup_version_raw  | default('unknown') }}"
+          firmware_ok:     "{{ firmware_gate_passed | bool }}"
+          backup_ok:       "{{ backup_ok | bool }}"
+          skip_reason:     "{{ firmware_skip_reason | default('') }}"
+          total:           "{{ total_count | int }}"
+          pass_count:      "{{ pass_count  | int }}"
+          fail_count:      "{{ fail_count  | int }}"
+          scripts:         "{{ test_summary }}"
+
+    - name: Append switch report to global list
+      set_fact:
+        global_report: "{{ (global_report | default([])) + [switch_report] }}"
+      run_once: false
+
+
+# ===========================================================
+# PLAY 2 — Global summary across ALL switches
+# ===========================================================
+- name: Global Test Summary
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Print global summary
+      debug:
+        msg: |
+
+          ╔══════════════════════════════════════════════════════════════╗
+                       HFCL SWITCH TEST SUITE — GLOBAL SUMMARY
+          ╚══════════════════════════════════════════════════════════════╝
+
+          {% set ns = namespace(
+               grand_pass=0, grand_fail=0, grand_total=0,
+               skipped_hosts=[], backup_warn=[], tested=0
+             ) %}
+
+          {% for hv in hostvars | dict2items %}
+          {% if hv.value.switch_report is defined %}
+          {% set entry = hv.value.switch_report %}
+
+          ┌──────────────────────────────────────────────────────────────┐
+            Switch   : {{ entry.host }}
+            Firmware : Primary={{ entry.primary_version }}  Backup={{ entry.backup_version }}
+          {% if not entry.firmware_ok %}
+            Status   : ⛔ SKIPPED
+                       {{ 'Backup has required FW — activate it' if entry.backup_ok else 'Upgrade required' }}
+          {% else %}
+            Status   : ✅ TESTED
+                       Tests={{ entry.total }}  PASS={{ entry.pass_count }}  FAIL={{ entry.fail_count }}
+          {% endif %}
+          ├──────────────────────────────────────────────────────────────┤
+          {% if not entry.firmware_ok %}
+            ⛔  Tests SKIPPED — {{ entry.skip_reason | truncate(70, True, '...') }}
+          {% else %}
+          {% for script, rc in entry.scripts.items() %}
+          {% if rc == 0 %}
+            ✅  {{ script }}
+          {% else %}
+            ❌  {{ script }}
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+          └──────────────────────────────────────────────────────────────┘
+
+          {% if not entry.firmware_ok %}
+          {% set _ = ns.skipped_hosts.append(entry.host) %}
+          {% if entry.backup_ok %}
+          {% set _ = ns.backup_warn.append(entry.host ~ ' (backup=' ~ entry.backup_version ~ ')') %}
+          {% endif %}
+          {% else %}
+          {% set ns.tested      = ns.tested      + 1 %}
+          {% set ns.grand_pass  = ns.grand_pass  + entry.pass_count | int %}
+          {% set ns.grand_fail  = ns.grand_fail  + entry.fail_count | int %}
+          {% set ns.grand_total = ns.grand_total + entry.total       | int %}
+          {% endif %}
+
+          {% endif %}
+          {% endfor %}
+
+          ══════════════════════════════════════════════════════════════
+            TOTAL SWITCHES   : {{ hostvars | dict2items
+                                   | selectattr('value.switch_report','defined')
+                                   | list | length }}
+            SWITCHES TESTED  : {{ ns.tested }}
+            SWITCHES SKIPPED : {{ ns.skipped_hosts | length }}
+                               {{ ns.skipped_hosts | join(', ') if ns.skipped_hosts else '(none)' }}
+          ──────────────────────────────────────────────────────────────
+            GRAND TOTAL TESTS: {{ ns.grand_total }}
+            GRAND PASS       : {{ ns.grand_pass }}
+            GRAND FAIL       : {{ ns.grand_fail }}
+            OVERALL RESULT   : {{ 'ALL TESTS PASSED ✅'
+                                   if ns.grand_fail == 0 and ns.skipped_hosts | length == 0
+                                   else 'FAIL ❌  (' ~ ns.grand_fail ~ ' test(s) failed)'
+                                   if ns.grand_fail > 0
+                                   else 'SKIPPED ⚠️  on ' ~ ns.skipped_hosts | length ~ ' switch(es)' }}
+          ══════════════════════════════════════════════════════════════
+
+          {% if ns.backup_warn | length > 0 %}
+          ⚠️  ACTION REQUIRED — Required firmware is in BACKUP on:
+          {% for w in ns.backup_warn %}
+            • {{ w }}
+              Steps: activate backup image → reboot → re-run playbook
+          {% endfor %}
+          {% elif ns.skipped_hosts | length > 0 %}
+          ❌  ACTION REQUIRED — Firmware upgrade needed on:
+          {% for h in ns.skipped_hosts %}
+            • {{ h }} — upgrade to v{{ required_version }} or above
+          {% endfor %}
+          {% endif %}

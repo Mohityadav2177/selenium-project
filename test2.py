@@ -5,7 +5,7 @@ import time
 
 
 # ===========================================================
-# Configuration
+# Configuration — overridden by sys.argv if provided
 # ===========================================================
 SWITCH_IP  = "192.168.180.136"
 ADMIN_USER = "admin"
@@ -27,7 +27,6 @@ def open_ssh_shell(hostname, username, password, port=22):
     )
     shell = client.invoke_shell()
     time.sleep(1)
-    # Drain banner
     _drain(shell)
     return client, shell
 
@@ -52,7 +51,7 @@ def _drain(shell):
 
 def try_ssh_login(hostname, username, password, port=22):
     """
-    Attempt SSH login. Returns (success: bool, message: str).
+    Attempt SSH login. Returns (success: bool, client, shell).
     Does NOT raise — all exceptions are caught and reported.
     """
     client = paramiko.SSHClient()
@@ -144,7 +143,6 @@ def run_test():
     print(f"  palc in config : {'✅ YES' if palc_exists else '❌ NO'}")
     results["users_created"] = "PASS" if (hfcl_exists and palc_exists) else "FAIL"
 
-    # Close admin session — keep switch in known state
     admin_client.close()
     print("\n✅ Admin SSH session closed")
 
@@ -153,7 +151,6 @@ def run_test():
     # -----------------------------------------------------------
     section("PHASE 2 — SSH Login Tests")
 
-    # Test A: valid user hfcl (priv 5)
     step(7, "Login with valid user 'hfcl' (privilege 5)")
     ok, hfcl_client, hfcl_shell = try_ssh_login(
         SWITCH_IP, "hfcl", "Discover@1234", SSH_PORT
@@ -173,7 +170,6 @@ def run_test():
         results["hfcl_login"] = "FAIL"
         hfcl_client = None
 
-    # Test B: wrong password
     step(8, "Login with WRONG PASSWORD for 'hfcl'")
     ok, c, s = try_ssh_login(SWITCH_IP, "hfcl", "WrongPass999", SSH_PORT)
     if not ok:
@@ -184,7 +180,6 @@ def run_test():
         results["wrong_password"] = "FAIL"
         c.close()
 
-    # Test C: non-existent user
     step(9, "Login with NON-EXISTENT user 'ghost'")
     ok, c, s = try_ssh_login(SWITCH_IP, "ghost", "Discover@1234", SSH_PORT)
     if not ok:
@@ -195,7 +190,6 @@ def run_test():
         results["nonexistent_user"] = "FAIL"
         c.close()
 
-    # Test D: multi-user — login as palc while hfcl still connected
     step(10, "Multi-user: login as 'palc' while 'hfcl' is still connected")
     ok, palc_client, palc_shell = try_ssh_login(
         SWITCH_IP, "palc", "Discover@1234", SSH_PORT
@@ -204,17 +198,16 @@ def run_test():
         print("✅ Login SUCCESSFUL for 'palc' (concurrent session)")
         out = send_cmd(palc_shell, "show users")
         print(out)
-        hfcl_seen  = "hfcl" in out  if hfcl_client  else True   # hfcl may have timed out
-        palc_seen  = "palc" in out
-        print(f"  hfcl visible : {'✅' if hfcl_seen  else '⚠️ '}")
-        print(f"  palc visible : {'✅' if palc_seen  else '⚠️ '}")
+        hfcl_seen = "hfcl" in out if hfcl_client else True
+        palc_seen = "palc" in out
+        print(f"  hfcl visible : {'✅' if hfcl_seen else '⚠️ '}")
+        print(f"  palc visible : {'✅' if palc_seen else '⚠️ '}")
         results["multi_user"] = "PASS" if palc_seen else "WARN"
         palc_client.close()
     else:
         print("❌ Login FAILED for 'palc' — UNEXPECTED")
         results["multi_user"] = "FAIL"
 
-    # Close hfcl session
     if hfcl_client:
         hfcl_client.close()
         print("\n✅ 'hfcl' session closed")
@@ -246,13 +239,13 @@ def run_test():
     section("TEST SUMMARY")
     all_pass = True
     rows = [
-        ("SSH enabled",          results.get("ssh_enabled")),
-        ("Users created",        results.get("users_created")),
-        ("hfcl login (priv 5)",  results.get("hfcl_login")),
-        ("Wrong password denied",results.get("wrong_password")),
-        ("Non-existent user denied", results.get("nonexistent_user")),
-        ("Multi-user concurrent",results.get("multi_user")),
-        ("Cleanup",              results.get("cleanup")),
+        ("SSH enabled",               results.get("ssh_enabled")),
+        ("Users created",             results.get("users_created")),
+        ("hfcl login (priv 5)",       results.get("hfcl_login")),
+        ("Wrong password denied",     results.get("wrong_password")),
+        ("Non-existent user denied",  results.get("nonexistent_user")),
+        ("Multi-user concurrent",     results.get("multi_user")),
+        ("Cleanup",                   results.get("cleanup")),
     ]
     for label, result in rows:
         icon = "✅" if result == "PASS" else ("⚠️ " if result == "WARN" else "❌")
@@ -262,7 +255,20 @@ def run_test():
 
     print()
     if all_pass:
-        print("🎉  ALL TESTS PASSED")
+        print("ALL TESTS PASSED \n")
+        print("TEST-HFCL-SW-02 - Management - Verify SSH service by lower privilege")
+        print(""" level, wrong password, user and Multi-User Connectivity \n PROCEDURE:-  	
+1. Enable the ssh server by configuring the ip ssh  command in configuration mode.
+2. Ensure that the show ip ssh command confirms that the Ssh service is enabled.
+3. Access the device using  ssh <ip_address>.
+4. Configure a new user account on the device with the command username hfcl privilege 5 password unencrypted  Discover@1234.
+5.Establish an SSH session to the device using the credentials of user hfcl for User EXEC Mode
+6. Validate successful user login by executing the show users command to confirm the session is active.
+7. Try login with wrong password and verify unsuccessful login.
+8.Try to login with user not created in box and verify  the unsuccessful  login .
+9.configure one more user  username palc privilege 5 password unencrypted  Discover@1234  and Verify Multiple users login
+
+              \n successfully passed.""")
     else:
         print("❌  ONE OR MORE TESTS FAILED — review output above")
     print("=" * 60)
@@ -271,5 +277,20 @@ def run_test():
 
 
 if __name__ == "__main__":
+    # Supports both direct run and Ansible invocation:
+    #   python3 test_ssh_privilege.py <ip> <username> <password>
+    if len(sys.argv) == 4:
+        SWITCH_IP  = sys.argv[1]
+        ADMIN_USER = sys.argv[2]
+        ADMIN_PASS = sys.argv[3]
+    elif len(sys.argv) == 1:
+        # Fallback defaults for local testing without args
+        SWITCH_IP  = "192.168.180.136"
+        ADMIN_USER = "admin"
+        ADMIN_PASS = "admin"
+    else:
+        print("Usage: python3 test_ssh_privilege.py <ip> <username> <password>")
+        sys.exit(1)
+
     success = run_test()
     sys.exit(0 if success else 1)

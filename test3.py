@@ -353,7 +353,20 @@ def run_test():
 
     print()
     if all_pass:
-        print("🎉  ALL TESTS PASSED")
+        print(""""🎉  ALL TESTS PASSED \n 
+
+TEST-HFCL-SW-03 - Management - Verify SSH port Customization and SSH client support.  \n 
+
+PROCEDURE:\n
+1.Enable the ssh server by configuring the ip ssh port 25 (changing default port number)
+command in configuration mode.
+2.Ensure that the show ip ssh command confirms that the Ssh service is enabled and port no reflected.
+3.Access the device using  ssh admin <management ip_address> port <1-65535>.
+4.Verify SSH client support from device by using ssh admin  <management ip addres>  port 25.
+5.Verify SSH client support from server by using  ssh admin <management ip_address> port <1-65535>.
+
+Successfully Passed!!!!!!!!!!!!!
+""")
     else:
         print("❌  ONE OR MORE TESTS FAILED — review output above")
     print("=" * 60)

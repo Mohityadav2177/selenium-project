@@ -1,20 +1,53 @@
 ---
-- name: Run switch automation script
+- name: Run multiple switch automation scripts
   hosts: switches
-  serial: 1
   gather_facts: no
+
+  vars:
+    python_path: /home/hfcl/jenkins-venv/bin/python
+    script_path: /home/hfcl/management-test-automation-scripts
+    scripts:
+      - test1.py
+      - test2.py
+      - test3.py
+      - test4.py
+      - test5.py
+      - test6.py
+      - test7.py
+      - test8.py
+      - test9.py
+      - test10.py
+
+
+
 
   tasks:
 
-    - name: Run python switch script locally
+    - name: Run scripts and capture result
       command: >
-        python3 test1.py
-        python3 test2.py
-        python3 test3.py
+        {{ python_path }} {{ script_path }}/{{ item }}
         {{ inventory_hostname }}
         {{ ansible_user }}
         {{ ansible_password }}
+      loop: "{{ scripts }}"
+      register: script_results
+      ignore_errors: yes
       delegate_to: localhost
 
+    - name: Set result summary per host
+      set_fact:
+        test_summary: >-
+          {{
+            dict(script_results.results | map(attribute='item') |
+            zip(script_results.results | map(attribute='rc')))
+          }}
 
-#python3 switch-config.py
+    - name: Print per-switch result
+      debug:
+        msg: |
+          ==============================
+          Switch: {{ inventory_hostname }}
+          ==============================
+          {% for script, rc in test_summary.items() %}
+          {{ script }} → {{ 'PASS' if rc == 0 else 'FAIL' }}
+          {% endfor %}

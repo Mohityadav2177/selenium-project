@@ -1,0 +1,8 @@
+[switches]
+#192.168.180.155
+191.168.180.157
+
+
+[switches:vars]
+ansible_user=admin
+ansible_password=admin

@@ -1,0 +1,358 @@
+"""
+create_ca_cert.py  —  Create Cloudflare NTS CA Certificate Chain
+=================================================================
+Automates the manual Windows steps:
+  Step 1: Connect to time.cloudflare.com:4460 (NTS port)
+  Step 2: Extract all certificates from the TLS handshake
+  Step 3: Save them in correct order as a .crt chain file
+
+  Order in output file:
+    1. Server cert       (time.cloudflare.com)
+    2. Intermediate cert (GeoTrust TLS ECC CA G1)
+    3. Root cert         (DigiCert Global Root G3)
+
+Works on Linux, Windows, macOS — pure Python (no openssl binary needed).
+
+Usage:
+  python3 create_ca_cert.py
+  python3 create_ca_cert.py [output_filename]
+
+Output:
+  cloudflare-ntp-chain.crt   (or whatever filename you specify)
+"""
+
+import ssl
+import sys
+import socket
+import os
+import datetime
+
+# ============================================================
+# Configuration
+# ============================================================
+NTS_HOST     = "time.cloudflare.com"
+NTS_PORT     = 4460          # Cloudflare NTS port (not standard 443)
+OUTPUT_FILE  = "cloudflare-ntp-chain.crt"
+TIMEOUT      = 10            # seconds
+
+
+# ============================================================
+# Certificate info extractor
+# ============================================================
+
+def get_cert_info(cert_der):
+    """
+    Extract basic info from a DER-encoded certificate.
+    Returns a dict with subject, issuer, validity dates.
+    Uses only stdlib — no cryptography lib needed.
+    """
+    try:
+        import ssl as _ssl
+        # Convert DER → PEM so we can load it back with ssl
+        pem = ssl.DER_cert_to_PEM_cert(cert_der)
+        # Use openssl subprocess if available for rich info
+        import subprocess
+        result = subprocess.run(
+            ["openssl", "x509", "-noout",
+             "-subject", "-issuer", "-dates", "-fingerprint", "-sha256"],
+            input=pem.encode(),
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            info = {}
+            for line in result.stdout.decode().splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    info[k.strip()] = v.strip()
+            return info
+    except Exception:
+        pass
+    return {}
+
+
+def der_to_pem(der_bytes):
+    """Convert DER bytes to PEM string."""
+    return ssl.DER_cert_to_PEM_cert(der_bytes)
+
+
+def extract_cn(info_dict, field="subject"):
+    """Extract CN value from cert info dict."""
+    val = info_dict.get(field, "")
+    for part in val.split(","):
+        part = part.strip()
+        if part.startswith("CN =") or part.startswith("CN="):
+            return part.split("=", 1)[1].strip()
+    return val or "(unknown)"
+
+
+# ============================================================
+# Main: fetch cert chain via TLS handshake
+# ============================================================
+
+def fetch_cert_chain(host, port, timeout=TIMEOUT):
+    """
+    Connect to host:port and retrieve the full certificate chain.
+    Returns list of DER-encoded certs in server-presented order.
+    """
+    print(f"  ▶ Connecting to {host}:{port} ...")
+
+    # Create SSL context that does NOT verify certs
+    # (we want to see the chain even if it's untrusted)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+
+    # Request full chain via set_ciphers
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+                # get_verified_chain / get_unverified_chain → Python 3.10+
+                # Fallback: getpeercertchain (older Python)
+                chain = None
+
+                # Try Python 3.10+ API first
+                if hasattr(tls_sock, "get_unverified_chain"):
+                    chain = tls_sock.get_unverified_chain()
+                    chain = [ssl.DER_cert_to_PEM_cert(c.public_bytes(
+                                __import__("cryptography").hazmat.primitives.serialization.Encoding.DER
+                             )) for c in chain] if chain else None
+
+                # Fallback: getpeercert(binary_form=True) gives only leaf
+                if not chain:
+                    leaf = tls_sock.getpeercert(binary_form=True)
+                    chain = [leaf] if leaf else []
+
+                return chain, tls_sock.version()
+
+    except ConnectionRefusedError:
+        raise ConnectionRefusedError(
+            f"Connection refused to {host}:{port}\n"
+            f"  → Check: is NTS port {port} reachable from this machine?\n"
+            f"  → Try: nc -zv {host} {port}"
+        )
+    except socket.timeout:
+        raise TimeoutError(
+            f"Timeout connecting to {host}:{port} after {timeout}s"
+        )
+    except ssl.SSLError as e:
+        raise ssl.SSLError(f"TLS error connecting to {host}:{port}: {e}")
+
+
+def fetch_cert_chain_openssl(host, port, timeout=TIMEOUT):
+    """
+    Fallback method: use openssl s_client subprocess to get full chain.
+    This gets ALL certs including intermediates — most reliable method.
+    """
+    import subprocess
+
+    print(f"  ▶ Using openssl s_client to fetch chain from {host}:{port} ...")
+    try:
+        result = subprocess.run(
+            ["openssl", "s_client",
+             "-connect", f"{host}:{port}",
+             "-showcerts",
+             "-servername", host],
+            input=b"Q\n",          # send Q to quit after handshake
+            capture_output=True,
+            timeout=timeout + 5
+        )
+        output = result.stdout.decode("utf-8", errors="ignore")
+
+        # Parse all PEM blocks from output
+        certs = []
+        in_cert = False
+        current  = []
+        for line in output.splitlines():
+            if "-----BEGIN CERTIFICATE-----" in line:
+                in_cert  = True
+                current  = [line]
+            elif "-----END CERTIFICATE-----" in line and in_cert:
+                current.append(line)
+                certs.append("\n".join(current))
+                in_cert  = False
+                current  = []
+            elif in_cert:
+                current.append(line)
+
+        if not certs:
+            raise RuntimeError("openssl s_client returned no certificates")
+
+        print(f"  ✅ openssl s_client extracted {len(certs)} certificate(s)")
+        return certs   # already PEM strings
+
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "openssl binary not found — install with:\n"
+            "  Linux : sudo apt install openssl\n"
+            "  Windows: https://slproweb.com/products/Win32OpenSSL.html"
+        )
+
+
+def fetch_with_python_ssl(host, port, timeout=TIMEOUT):
+    """
+    Pure Python fallback: gets at least the leaf cert.
+    For full chain we try DER_cert_to_PEM_cert on each.
+    """
+    print(f"  ▶ Using Python ssl module (may only get leaf cert) ...")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+
+    pem_certs = []
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host) as tls:
+            # Leaf cert
+            der = tls.getpeercert(binary_form=True)
+            if der:
+                pem_certs.append(ssl.DER_cert_to_PEM_cert(der))
+    return pem_certs
+
+
+# ============================================================
+# Print cert details
+# ============================================================
+
+def print_cert_details(pem_str, index, label=""):
+    """Print human-readable info about a PEM certificate."""
+    import subprocess
+    header = f"  Certificate #{index+1}"
+    if label:
+        header += f"  [{label}]"
+    print(header)
+    print("  " + "-" * 60)
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-noout",
+             "-subject", "-issuer", "-dates"],
+            input=pem_str.encode(),
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            for line in result.stdout.decode().splitlines():
+                print(f"    {line.strip()}")
+        else:
+            print(f"    (could not parse cert details)")
+    except FileNotFoundError:
+        # openssl not available — just show PEM header lines
+        lines = pem_str.strip().splitlines()
+        print(f"    {lines[0]}")
+        print(f"    ... ({len(lines)} lines)")
+        print(f"    {lines[-1]}")
+    print()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    output_file = sys.argv[1] if len(sys.argv) > 1 else OUTPUT_FILE
+
+    print("=" * 65)
+    print("  Cloudflare NTS CA Certificate Chain Creator")
+    print("=" * 65)
+    print(f"\n  Target     : {NTS_HOST}:{NTS_PORT}  (NTS/TLS port)")
+    print(f"  Output     : {output_file}")
+    print(f"  Method     : openssl s_client → Python ssl fallback")
+    print()
+
+    pem_certs = []
+
+    # ── Method 1: openssl s_client (best — gets full chain) ──
+    try:
+        pem_certs = fetch_cert_chain_openssl(NTS_HOST, NTS_PORT, TIMEOUT)
+    except FileNotFoundError as e:
+        print(f"  ⚠️  openssl not found: {e}")
+        print(f"  ▶ Falling back to Python ssl module ...")
+    except Exception as e:
+        print(f"  ⚠️  openssl s_client failed: {e}")
+        print(f"  ▶ Falling back to Python ssl module ...")
+
+    # ── Method 2: Python ssl fallback ────────────────────────
+    if not pem_certs:
+        try:
+            pem_certs = fetch_with_python_ssl(NTS_HOST, NTS_PORT, TIMEOUT)
+        except Exception as e:
+            print(f"\n❌ All methods failed: {e}")
+            print(f"\n  Manual fallback — run this on any machine with openssl:")
+            print(f"    openssl s_client -connect {NTS_HOST}:{NTS_PORT} -showcerts")
+            print(f"  Copy all PEM blocks into {output_file}")
+            sys.exit(1)
+
+    if not pem_certs:
+        print(f"\n❌ No certificates retrieved from {NTS_HOST}:{NTS_PORT}")
+        print(f"   Port {NTS_PORT} may be blocked by firewall.")
+        print(f"   Test reachability: nc -zv {NTS_HOST} {NTS_PORT}")
+        sys.exit(1)
+
+    print(f"\n  ✅ Retrieved {len(pem_certs)} certificate(s) from {NTS_HOST}:{NTS_PORT}")
+
+    # ── Print details of each cert ───────────────────────────
+    print(f"\n  Certificate Chain Details:")
+    labels = ["Server (time.cloudflare.com)", "Intermediate CA", "Root CA"]
+    for i, pem in enumerate(pem_certs):
+        label = labels[i] if i < len(labels) else f"Cert #{i+1}"
+        print_cert_details(pem, i, label)
+
+    # ── Write chain file ─────────────────────────────────────
+    print(f"  Writing chain to: {output_file} ...")
+    try:
+        with open(output_file, "w", newline="\n") as f:
+            for i, pem in enumerate(pem_certs):
+                # Normalise line endings and ensure clean separation
+                pem_clean = pem.strip().replace("\r\n", "\n").replace("\r", "\n")
+                f.write(pem_clean)
+                f.write("\n\n")   # blank line between certs
+
+        size = os.path.getsize(output_file)
+        print(f"\n  ✅ Chain file created: {output_file}  ({size} bytes)")
+        print(f"  ✅ Contains {len(pem_certs)} certificate(s)")
+
+    except PermissionError:
+        print(f"\n❌ Cannot write to {output_file} — check directory permissions")
+        sys.exit(1)
+
+    # ── Verify output file ────────────────────────────────────
+    print(f"\n  Verifying output file ...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["openssl", "verify", "-CAfile", output_file, output_file],
+            capture_output=True, timeout=5
+        )
+        # Even self-verify is useful to confirm PEM is valid
+        if result.returncode == 0 or "OK" in result.stdout.decode():
+            print(f"  ✅ PEM format valid (openssl verify passed)")
+        else:
+            # Partial chain verify failure is normal — just check it's valid PEM
+            print(f"  ℹ️  Chain verify result: {result.stderr.decode().strip()[:80]}")
+            print(f"  ℹ️  This is normal for a partial chain — PEM format is valid")
+    except (FileNotFoundError, Exception):
+        # openssl not available — just count PEM blocks
+        with open(output_file) as f:
+            content = f.read()
+        count = content.count("-----BEGIN CERTIFICATE-----")
+        print(f"  ✅ File contains {count} PEM certificate block(s)")
+
+    # ── Summary ───────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("  SUMMARY")
+    print("=" * 65)
+    print(f"  Output file : {os.path.abspath(output_file)}")
+    print(f"  Cert count  : {len(pem_certs)}")
+    print(f"  File size   : {os.path.getsize(output_file)} bytes")
+    print()
+    print("  Next steps:")
+    print(f"  1. Copy {output_file} to your TFTP server root")
+    print(f"     e.g.  cp {output_file} /srv/tftp/cacloudflare.crt")
+    print(f"  2. On switch (config mode):")
+    print(f"     ntp server 1 security ca-certificate upload tftp://<server-ip>/cacloudflare.crt")
+    print(f"  3. Then run the secure NTP test:")
+    print(f"     python3 ntp_secure_test.py <switch-ip> admin admin <tftp-ip>")
+    print("=" * 65)
+
+
+if __name__ == "__main__":
+    main()

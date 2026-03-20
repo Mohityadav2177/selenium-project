@@ -1,0 +1,166 @@
+---
+# ===========================================================
+# TEST-HFCL  —  Switch Test Automation Playbook
+# ===========================================================
+# Runs all test scripts against each switch and produces a
+# per-switch summary showing PASS/FAIL count + per-script result.
+#
+# Usage:
+#   ansible-playbook switch.yaml -i inventory.ini
+#
+# Expected inventory.ini:
+#   [switches]
+#   192.168.180.155  ansible_user=admin  ansible_password=admin
+#   192.168.180.136  ansible_user=admin  ansible_password=admin
+# ===========================================================
+
+- name: HFCL Switch Test Suite
+  hosts: switches
+  gather_facts: false
+  vars:
+    python_path: "/home/hfcl/jenkins-venv/bin/python3"
+    script_path: "/home/hfcl"
+    scripts:
+      - test1.py
+      - test2.py
+      - test3.py
+      - test4.py
+      - test5.py
+      - test6.py
+      - test7.py
+      - test8.py
+      - test9.py
+      - test10.py
+
+
+  tasks:
+
+    # ─────────────────────────────────────────────────────
+    # STEP 1 — Run all test scripts on each switch
+    # ─────────────────────────────────────────────────────
+    - name: Run test scripts
+      command: >
+        {{ python_path }} {{ script_path }}/{{ item }}
+        {{ inventory_hostname }}
+        {{ ansible_user }}
+        {{ ansible_password }}
+      loop: "{{ scripts }}"
+      register: script_results
+      ignore_errors: yes
+      delegate_to: localhost
+
+    # ─────────────────────────────────────────────────────
+    # STEP 2 — Build result map  { script: rc }
+    # ─────────────────────────────────────────────────────
+    - name: Build result summary per switch
+      set_fact:
+        test_summary: >-
+          {{
+            dict(
+              script_results.results | map(attribute='item') |
+              zip(script_results.results | map(attribute='rc'))
+            )
+          }}
+
+    # ─────────────────────────────────────────────────────
+    # STEP 3 — Count PASS / FAIL per switch
+    # ─────────────────────────────────────────────────────
+    - name: Count PASS and FAIL per switch
+      set_fact:
+        pass_count: "{{ test_summary.values() | select('equalto', 0) | list | length }}"
+        fail_count: "{{ test_summary.values() | reject('equalto', 0) | list | length }}"
+        total_count: "{{ test_summary | length }}"
+
+    # ─────────────────────────────────────────────────────
+    # STEP 4 — Print detailed result per switch
+    # ─────────────────────────────────────────────────────
+    - name: Print per-switch test result
+      debug:
+        msg: |
+
+          ╔══════════════════════════════════════════════════════╗
+            Switch : {{ inventory_hostname }}
+            Total  : {{ total_count }} tests
+            PASS   : {{ pass_count }}  |  FAIL : {{ fail_count }}
+          ╚══════════════════════════════════════════════════════╝
+
+          {% for script, rc in test_summary.items() %}
+          {% if rc == 0 %}
+            ✅  PASS  →  {{ script }}
+          {% else %}
+            ❌  FAIL  →  {{ script }}  (exit code: {{ rc }})
+          {% endif %}
+          {% endfor %}
+
+          ── RESULT : {{ 'ALL PASSED ✅' if fail_count | int == 0 else fail_count | string + ' TEST(S) FAILED ❌' }} ──
+
+    # ─────────────────────────────────────────────────────
+    # STEP 5 — Collect all results across switches for
+    #          the final global summary
+    # ─────────────────────────────────────────────────────
+    - name: Store per-switch counts for global summary
+      set_fact:
+        switch_report:
+          host:        "{{ inventory_hostname }}"
+          total:       "{{ total_count | int }}"
+          pass_count:  "{{ pass_count  | int }}"
+          fail_count:  "{{ fail_count  | int }}"
+          scripts:     "{{ test_summary }}"
+      delegate_to: localhost
+      delegate_facts: false
+
+    - name: Append to global report list
+      set_fact:
+        global_report: "{{ (global_report | default([])) + [switch_report] }}"
+      delegate_to: localhost
+      run_once: false
+
+
+# ===========================================================
+# PLAY 2 — Global summary across ALL switches
+# ===========================================================
+- name: Global Test Summary
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Print global summary across all switches
+      debug:
+        msg: |
+
+          ╔══════════════════════════════════════════════════════════════╗
+                       HFCL SWITCH TEST SUITE — GLOBAL SUMMARY
+          ╚══════════════════════════════════════════════════════════════╝
+
+          {% set ns = namespace(grand_pass=0, grand_fail=0, grand_total=0) %}
+          {% for entry in hostvars | dict2items
+               | selectattr('value.switch_report', 'defined')
+               | map(attribute='value.switch_report') %}
+
+          ┌──────────────────────────────────────────────────────────────┐
+            Switch  : {{ entry.host }}
+            Tests   : {{ entry.total }}  |  PASS: {{ entry.pass_count }}  |  FAIL: {{ entry.fail_count }}
+          ├──────────────────────────────────────────────────────────────┤
+          {% for script, rc in entry.scripts.items() %}
+          {% if rc == 0 %}
+            ✅  {{ script }}
+          {% else %}
+            ❌  {{ script }}
+          {% endif %}
+          {% endfor %}
+          └──────────────────────────────────────────────────────────────┘
+          {% set ns.grand_pass  = ns.grand_pass  + entry.pass_count  | int %}
+          {% set ns.grand_fail  = ns.grand_fail  + entry.fail_count  | int %}
+          {% set ns.grand_total = ns.grand_total + entry.total        | int %}
+          {% endfor %}
+
+          ══════════════════════════════════════════════════════════════
+            TOTAL SWITCHES : {{ hostvars | dict2items
+                                 | selectattr('value.switch_report','defined')
+                                 | list | length }}
+            GRAND TOTAL    : {{ ns.grand_total }} tests
+            GRAND PASS     : {{ ns.grand_pass }}
+            GRAND FAIL     : {{ ns.grand_fail }}
+            OVERALL RESULT : {{ 'ALL TESTS PASSED ✅' if ns.grand_fail == 0
+                                 else ns.grand_fail | string + ' TEST(S) FAILED ❌' }}
+          ══════════════════════════════════════════════════════════════
